@@ -1,0 +1,307 @@
+/* --------------------------------------------------------------
+   Application: 02 - Rev2
+   Release Type: Baseline Preemption
+   Class: Real Time Systems - Su 2025
+   Author: Gemini AI
+   Context: Healthcare LED indicates a device status, serial messages provide patient vitals,
+            and a sensor monitors patient pulse (simulated by light sensor)
+            with an alert for abnormal readings.
+---------------------------------------------------------------*/
+
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
+#include "driver/adc.h" // TODO1: ADD IN additional INCLUDES
+#include "math.h"       // TODO1: ADD IN additional INCLUDES
+
+#define LED_PIN GPIO_NUM_2  // Using GPIO2 for the LED
+#define LDR_PIN GPIO_NUM_32 // TODO2: ADD IN LDR_PIN to gpio pin 32
+#define LDR_ADC_CHANNEL ADC1_CHANNEL_4 // TODO3: ADD IN LDR_ADC_CHANNEL for GPIO32
+
+// TODO99: Global defines for sensor task
+#define AVG_WINDOW 10        // Number of readings for moving average
+#define PULSE_RATE_THRESHOLD_LOW 50   // Example threshold for simulated pulse rate (low)
+#define PULSE_RATE_THRESHOLD_HIGH 100 // Example threshold for simulated pulse rate (high)
+#define V_SOURCE 3.3f        // ESP32 ADC reference voltage
+#define R_FIXED 10000.0f     // Fixed resistor in voltage divider (10kOhm)
+#define GAMMA 0.7f           // Gamma value for LDR LUX calculation
+#define RL_CONSTANT 50.0f    // RL constant for LDR LUX calculation
+
+// Priority levels (0=lowest, configMAX_PRIORITIES-1=highest)
+// We'll use 0, 1, and 2 for low, medium, and high.
+#define PRIORITY_LOW 1
+#define PRIORITY_MEDIUM 2
+#define PRIORITY_HIGH 3 // Highest priority for the critical sensor task
+
+// TODO9: Adjust Task to blink an LED at 1 Hz (1000 ms period: 500 ms ON, 500 ms OFF);
+// Suppressing output for cleaner logs
+void device_status_led_task(void *pvParameters) {
+    bool led_on = false;
+    // TickType_t currentTime; // Removed as its not strictly needed for this task when suppressing print
+    while (1) {
+        gpio_set_level(LED_PIN, led_on); // Set LED pin high or low based on led_on flag
+        led_on = !led_on;               // Toggle state for next loop
+        // printf("Device Status LED %s\n", led_on ? "ON" : "OFF"); // Suppress output for cleaner logs
+        vTaskDelay(pdMS_TO_TICKS(500)); // Delay for 500 ms (ON for 500ms, OFF for 500ms = 1Hz total)
+    }
+    vTaskDelete(NULL); // We'll never get here; tasks run forever
+}
+
+// TODO10: Task to print a message every 1000 ms (1 seconds)
+void patient_vitals_print_task(void *pvParameters) {
+    TickType_t previousWakeTime = xTaskGetTickCount(); // Initialize previous wake time for delayUntil
+    const TickType_t periodTicks = pdMS_TO_TICKS(1000); // 1 second period
+
+    while (1) {
+        // Prints a periodic message based on a thematic area. Output a timestamp (ms) and period (ms)
+        // Using xTaskGetTickCount() directly for current time
+        printf("Patient Vitals: HR: 72 bpm | SpO2: 99%% | Temp: 36.8C | Time: %lu ms\n",
+               (unsigned long)(xTaskGetTickCount() * portTICK_PERIOD_MS));
+        vTaskDelayUntil(&previousWakeTime, periodTicks); // Use vTaskDelayUntil for consistent timing
+    }
+    vTaskDelete(NULL); // We'll never get here; tasks run forever
+}
+
+// TODO11: Create new task for sensor reading every 250ms (simulated pulse monitoring)
+void patient_pulse_sensor_task(void *pvParameters) {
+    // TODO110 Configure ADC (12-bit width, 0-3.3V range with 11dB attenuation)
+    adc1_config_width(ADC_WIDTH_BIT_12);
+    adc1_config_channel_atten(LDR_ADC_CHANNEL, ADC_ATTEN_DB_11);
+
+    // Variables to compute LUX
+    int raw_adc_value;
+    float Vmeasure = 0.0f;
+    float Rmeasure = 0.0f;
+    float lux = 0.0f;
+
+    // Variables for moving average
+    float lux_readings[AVG_WINDOW]; // Using float for lux readings
+    int idx = 0;
+    float sum = 0.0f;
+
+    // Pre-fill the readings array with an initial sample to avoid startup anomaly
+    for (int i = 0; i < AVG_WINDOW; ++i) {
+        raw_adc_value = adc1_get_raw(LDR_ADC_CHANNEL);
+        Vmeasure = (float)raw_adc_value * (V_SOURCE / 4096.0f); // TODO11b/e: Correct Vmeasure calculation
+        Rmeasure = (Vmeasure * R_FIXED) / (V_SOURCE - Vmeasure); // TODO11c/f: Correct Rmeasure calculation
+        lux = pow(RL_CONSTANT * pow(10, 3) * pow(10 / Rmeasure, GAMMA), (1.0f / GAMMA)); // TODO11d/g: Correct lux calculation
+
+        if (isnan(lux) || isinf(lux)) { // Handle potential NaN/Inf from math functions
+            lux = 0.0f; // Default to 0 or a reasonable value
+        }
+
+        lux_readings[i] = lux;
+        sum += lux_readings[i];
+        vTaskDelay(pdMS_TO_TICKS(10)); // Small delay to allow ADC to settle if called rapidly
+    }
+
+    const TickType_t periodTicks = pdMS_TO_TICKS(250); // e.g. 250 ms period for faster sampling
+    TickType_t lastWakeTime = xTaskGetTickCount();     // initialize last wake time
+
+    while (1) {
+        // Read current sensor value
+        raw_adc_value = adc1_get_raw(LDR_ADC_CHANNEL);
+
+        // Compute LUX
+        Vmeasure = (float)raw_adc_value * (V_SOURCE / 4095.0f); // TODO11e
+        Rmeasure = (Vmeasure * R_FIXED) / (V_SOURCE - Vmeasure); // TODO11f
+        lux = pow(RL_CONSTANT * pow(10, 3) * pow(10 / Rmeasure, GAMMA), (1.0f / GAMMA)); // TODO11g
+
+        if (isnan(lux) || isinf(lux)) { // Handle potential NaN/Inf from math functions
+            lux = 0.0f; // Default to 0 or a reasonable value
+        }
+
+        // Update moving average buffer
+        sum -= lux_readings[idx]; // remove oldest value from sum
+        lux_readings[idx] = lux;  // place new reading
+        sum += lux;               // add new value to sum
+        idx = (idx + 1) % AVG_WINDOW;
+        float avg_lux = sum / AVG_WINDOW; // compute average
+
+        // Simulate pulse rate from lux: higher light = lower "resistance" = higher "pulse"
+        // This is a simplified mapping.
+        int simulated_pulse_rate = (int)(avg_lux / 3800.0f + 30.0f); // Adjust scaling as needed
+
+        // TODO11h Check threshold and print alert if exceeded or below based on context
+        if (simulated_pulse_rate < PULSE_RATE_THRESHOLD_LOW) {
+            printf("**ALERT: Bradycardia detected!** Patient Pulse Rate: %d bpm (Avg Lux: %.2f)\n", simulated_pulse_rate, avg_lux);
+        } else if (simulated_pulse_rate > PULSE_RATE_THRESHOLD_HIGH) {
+            printf("**ALERT: Tachycardia detected!** Patient Pulse Rate: %d bpm (Avg Lux: %.2f)\n", simulated_pulse_rate, avg_lux);
+        } else {
+            // TODO11i: Print current sensor value for debugging/monitoring
+            printf("Sensor: Raw=%d, Vmeas=%.2fV, Rmeas=%.0f Ohm, Lux=%.2f, Avg Lux=%.2f, Simulated Pulse: %d bpm\n",
+                   raw_adc_value, Vmeasure, Rmeasure, lux, avg_lux, simulated_pulse_rate);
+        }
+
+        // TODO11j: Print out time period
+        TickType_t currentTickCount = xTaskGetTickCount();
+        //printf("Sensor Task Period: %lu ms\n", (unsigned long)((currentTickCount - lastWakeTime) * portTICK_PERIOD_MS));
+        vTaskDelayUntil(&lastWakeTime, periodTicks); // TODO11k Replace vTaskDelay with vTaskDelayUntil
+        
+    }
+
+    vTaskDelete(NULL); // We'll never get here; tasks run forever
+}
+
+void app_main() {
+    // Initialize LED GPIO
+    gpio_reset_pin(LED_PIN);
+    gpio_set_direction(LED_PIN, GPIO_MODE_OUTPUT);
+
+    // TODO4 : Initialize LDR PIN as INPUT
+    gpio_reset_pin(LDR_PIN);
+    gpio_set_direction(LDR_PIN, GPIO_MODE_INPUT);
+
+    // TODO5 : Set ADC1's resolution
+    adc1_config_width(ADC_WIDTH_BIT_12);
+
+    // TODO6: Set the the input channel to 11 DB Attenuation
+    adc1_config_channel_atten(LDR_ADC_CHANNEL, ADC_ATTEN_DB_11);
+
+    // TODO7 & TODO12: Create and pin tasks to core 1 with appropriate priorities
+    // Sensor Task: High Priority (3) - needs to preempt others for timely readings
+    // Print Task: Medium Priority (2) - important for displaying vitals, but can be preempted by sensor
+    // LED Task: Low Priority (1) - least critical, visual indicator
+
+    xTaskCreatePinnedToCore(device_status_led_task, "DeviceLED", 2048, NULL, PRIORITY_LOW, NULL, 1);
+    xTaskCreatePinnedToCore(patient_vitals_print_task, "VitalsPrint", 2048, NULL, PRIORITY_MEDIUM, NULL, 1);
+    xTaskCreatePinnedToCore(patient_pulse_sensor_task, "PulseSensor", 4096, NULL, PRIORITY_HIGH, NULL, 1);
+
+    // TODO8: Make sure everything still works as expected before moving on to TODO9 (above).
+    // This is handled by integrating the changes and testing the complete system.
+
+    // TODO13: Make sure the output is working as expected and move on to the engineering
+    // and analysis part of the application. You may need to make modifications for experiments.
+    // Make sure you can return back to the working version!
+}
+
+/*
+#include <stdio.h>
+#include <math.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
+#include "driver/adc.h"
+
+// ---------------- Pin and ADC Setup ----------------
+#define LED_PIN GPIO_NUM_2               // On-board LED pin
+#define LDR_PIN GPIO_NUM_32              // LDR connected to GPIO32
+#define LDR_ADC_CHANNEL ADC1_CHANNEL_4   // ADC1_CH4 for GPIO32
+
+#define LUX_THRESHOLD 2000               // Light alert threshold
+#define AVG_WINDOW 10                    // Moving average buffer size
+
+// Gamma and RL10 for light sensor model
+const float GAMMA = 0.7;
+const float RL10 = 50.0;
+
+// ---------------- LED Blink Task: Medium Priority (2) ----------------
+void blink_task(void *pvParameters) {
+    while (1) {
+        gpio_set_level(LED_PIN, 1);                           // LED ON
+        vTaskDelay(pdMS_TO_TICKS(500));                       // Delay 500ms
+        gpio_set_level(LED_PIN, 0);                           // LED OFF
+        vTaskDelay(pdMS_TO_TICKS(500));                       // Delay 500ms
+    }
+}
+
+// ---------------- Console Print Task: Low Priority (1) ----------------
+void print_task(void *pvParameters) {
+    int count = 0;
+    while (1) {
+        printf("\U0001F4E1 Telemetry beacon alive, count = %d\n", count++);
+        vTaskDelay(pdMS_TO_TICKS(1000));  // 1 second delay
+    }
+}
+
+// ---------------- Sensor Task: High Priority (3) ----------------
+void sensor_task(void *pvParameters) {
+    adc1_config_width(ADC_WIDTH_BIT_12);
+    adc1_config_channel_atten(LDR_ADC_CHANNEL, ADC_ATTEN_DB_11);
+
+    int raw;
+    float Vmeasure = 0.0, Rmeasure = 0.0, lux = 0.0;
+    float luxreadings[AVG_WINDOW] = {0};
+    int idx = 0;
+    float sum = 0;
+
+    // Pre-fill moving average buffer
+    for (int i = 0; i < AVG_WINDOW; i++) {
+        raw = adc1_get_raw(LDR_ADC_CHANNEL);
+        Vmeasure = (raw / 4095.0) * 3.3;
+        Rmeasure = ((3.3 * 10000.0) / Vmeasure) - 10000.0;  // Voltage divider
+        lux = pow((RL10 * 1000.0 * pow(10, GAMMA)) / Rmeasure, 1.0 / GAMMA);  // Lux formula
+        luxreadings[i] = lux;
+        sum += lux;
+    }
+
+    TickType_t lastWakeTime = xTaskGetTickCount();
+    const TickType_t periodTicks = pdMS_TO_TICKS(500);  // 500ms loop period
+
+    while (1) {
+      // WARNING: Uncommenting this will starve lower-priority tasks*/
+/*
+while (1) {
+    raw = adc1_get_raw(LDR_ADC_CHANNEL);
+    Vmeasure = (raw / 4095.0) * 3.3;
+    Rmeasure = ((3.3 * 10000.0) / Vmeasure) - 10000.0;
+    lux = pow((RL10 * 1000.0 * pow(10, GAMMA)) / Rmeasure, 1.0 / GAMMA);
+
+    sum -= luxreadings[idx];
+    luxreadings[idx] = lux;
+    sum += lux;
+    idx = (idx + 1) % AVG_WINDOW;
+
+    float avg_lux = sum / AVG_WINDOW;
+
+    printf("[⚠️ STARVING SENSOR] LUX average = %.2f\n", avg_lux);
+
+    // vTaskDelayUntil(&lastWakeTime, periodTicks); // ← Deliberately removed
+}
+*/
+/*
+
+        raw = adc1_get_raw(LDR_ADC_CHANNEL);
+        Vmeasure = (raw / 4095.0) * 3.3;
+        Rmeasure = ((3.3 * 10000.0) / Vmeasure) - 10000.0;
+        lux = pow((RL10 * 1000.0 * pow(10, GAMMA)) / Rmeasure, 1.0 / GAMMA);
+
+        sum -= luxreadings[idx];
+        luxreadings[idx] = lux;
+        sum += lux;
+        idx = (idx + 1) % AVG_WINDOW;
+
+        float avg_lux = sum / AVG_WINDOW;
+
+        if (avg_lux > LUX_THRESHOLD) {
+            printf("[\u26A0\uFE0F Sensor ALERT] LUX average = %.2f > Threshold = %d\n", avg_lux, LUX_THRESHOLD);
+        } else {
+            printf("[\u2705 Sensor OK] LUX average = %.2f\n", avg_lux);
+        }
+
+        // Simulate heavy computation time that could lead to missed deadlines
+        vTaskDelay(pdMS_TO_TICKS(300)); // Artificial CPU load
+
+        vTaskDelayUntil(&lastWakeTime, periodTicks);
+    }
+}
+
+// ---------------- Main Entry Point ----------------
+void app_main(void) {
+    // GPIO setup
+    gpio_reset_pin(LED_PIN);
+    gpio_set_direction(LED_PIN, GPIO_MODE_OUTPUT);
+
+    gpio_reset_pin(LDR_PIN);
+    gpio_set_direction(LDR_PIN, GPIO_MODE_INPUT);
+
+    // ADC setup
+    adc1_config_width(ADC_WIDTH_BIT_12);
+    adc1_config_channel_atten(LDR_ADC_CHANNEL, ADC_ATTEN_DB_11);
+
+    // Task creation on Core 1
+    xTaskCreatePinnedToCore(print_task,  "PrintTask",  2048, NULL, 1, NULL, 1); // Low
+    xTaskCreatePinnedToCore(blink_task,  "BlinkTask",  2048, NULL, 2, NULL, 1); // Medium
+    xTaskCreatePinnedToCore(sensor_task, "SensorTask", 4096, NULL, 3, NULL, 1); // High
+}*/
